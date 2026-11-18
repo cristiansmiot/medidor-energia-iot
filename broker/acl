@@ -1,0 +1,54 @@
+# =============================================================================
+# acl — Control de Acceso por Topic (Mosquitto ACL)
+# =============================================================================
+#
+# Sintaxis:
+#   user <usuario>          → aplica las reglas siguientes a ese usuario
+#   topic read  <topic>     → solo suscripcion
+#   topic write <topic>     → solo publicacion
+#   topic readwrite <topic> → publicacion y suscripcion
+#   topic <topic>           → readwrite (por defecto si no se especifica)
+#   Wildcards: + (un nivel), # (todos los niveles)
+#
+# Orden de evaluacion: las reglas se evaluan en orden. La primera que coincida
+# determina el acceso. Si ninguna coincide, el acceso se deniega.
+# =============================================================================
+
+# ── medidor_iot ───────────────────────────────────────────────────────────────
+# Usuario compartido por el firmware ESP32 (publisher) y el backend FastAPI
+# (subscriber). En un entorno de produccion se usarian usuarios separados.
+#
+# Firmware publica en:
+#   medidor/ESP32-001/datos     → QoS 0, retain=0
+#   medidor/ESP32-001/estado    → QoS 1, retain=1
+#   medidor/ESP32-001/alerta    → QoS 1, retain=0
+#   medidor/ESP32-001/conexion  → QoS 1, retain=1 (online / LWT offline)
+#
+# Backend se suscribe a: medidor/#
+#
+user medidor_iot
+topic readwrite medidor/#
+
+# ── Esquema multi-medidor (plug and play) ─────────────────────────────────────
+# Para escalar a N medidores sin editar este archivo por cada equipo, usar la
+# regla `pattern` de Mosquitto: %u se sustituye por el username autenticado.
+# Si cada nodo se conecta con username = su IMEI (el firmware ya lo lee del
+# SIM7080G), cada medidor queda confinado a su propia rama de topics:
+#
+#   pattern readwrite medidor/%u/#
+#
+# Aprovisionar un medidor nuevo se reduce a un comando en el broker:
+#   mosquitto_passwd -b /mosquitto/config/passwd <IMEI> <clave-unica>
+# y grabar esa credencial en el nodo. Asi ningun medidor puede publicar a
+# nombre de otro (con el usuario compartido actual, un nodo comprometido
+# podria suplantar a toda la flota).
+#
+# El backend conserva un usuario propio con lectura global y escritura solo
+# en el topic de comandos:
+#
+# user backend_plataforma
+# topic read  medidor/#
+# topic write medidor/+/cmd
+#
+# Para activar el esquema: descomentar el `pattern`, crear los usuarios por
+# IMEI, crear backend_plataforma y retirar el usuario compartido medidor_iot.
