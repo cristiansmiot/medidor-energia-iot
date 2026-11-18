@@ -1,0 +1,399 @@
+"""Admin - Diagnóstico y seed de base de datos"""
+import os
+from collections import Counter
+from typing import Optional
+
+from fastapi import APIRouter, Depends, Request
+from sqlalchemy.orm import Session
+from sqlalchemy import text, inspect
+from datetime import datetime, timezone
+
+from fastapi import Query
+from app.database import get_db, get_engine
+from app.services.audit import registrar_accion
+from app.models.dispositivo import Dispositivo
+from app.models.medicion import Medicion
+from app.models.nodo_salud import NodoSalud
+from app.models.usuario import Usuario
+from app.models.evento import Evento
+from app.models.audit_log import AuditLog
+from app.services.auth import get_current_user, require_super_admin
+
+# Candado a nivel de router: TODOS los endpoints de /admin exigen rol
+# super_admin. Antes seed/limpiar/diagnostico quedaron públicos y cualquiera
+# podía sembrar datos falsos o borrar dispositivos de producción.
+router = APIRouter(
+    prefix="/admin",
+    tags=["Admin"],
+    dependencies=[Depends(require_super_admin)],
+)
+
+# Token para el reinicio administrativo de la base. Sin RESET_TOKEN en el entorno
+# el endpoint queda deshabilitado.
+_RESET_TOKEN = os.environ.get("RESET_TOKEN", "")
+
+
+@router.get("/diagnostico")
+def diagnostico_bd(db: Session = Depends(get_db)):
+    """
+    Diagnóstico completo de la base de datos.
+    Muestra tablas existentes, conteo de registros y estado general.
+    """
+    engine = get_engine()
+    inspector = inspect(engine)
+
+    # Tablas existentes
+    tablas = inspector.get_table_names()
+
+    # Conteos
+    conteos = {}
+    modelos = {
+        "dispositivos": Dispositivo,
+        "mediciones": Medicion,
+        "nodo_salud": NodoSalud,
+        "usuarios": Usuario,
+        "eventos": Evento,
+        "audit_log": AuditLog,
+    }
+
+    for nombre, modelo in modelos.items():
+        try:
+            conteos[nombre] = db.query(modelo).count()
+        except Exception as e:
+            conteos[nombre] = f"Error: {str(e)}"
+
+    # Info de dispositivos existentes
+    dispositivos = []
+    try:
+        devs = db.query(Dispositivo).all()
+        for d in devs:
+            dispositivos.append({
+                "id": d.id,
+                "device_id": d.device_id,
+                "nombre": d.nombre,
+                "ubicacion": d.ubicacion,
+                "conectado": d.conectado,
+                "ultima_conexion": d.ultima_conexion.isoformat() if d.ultima_conexion else None,
+                "created_at": d.created_at.isoformat() if d.created_at else None,
+            })
+    except Exception as e:
+        dispositivos = [{"error": str(e)}]
+
+    # Info de conexión
+    db_url = str(engine.url)
+    # Enmascarar contraseña
+    if "@" in db_url:
+        parts = db_url.split("@")
+        prefix = parts[0].rsplit(":", 1)[0]
+        db_url = f"{prefix}:***@{parts[1]}"
+
+    return {
+        "database_url": db_url,
+        "tablas_existentes": tablas,
+        "conteo_registros": conteos,
+        "dispositivos": dispositivos,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@router.post("/seed")
+def seed_dispositivos(db: Session = Depends(get_db)):
+    """
+    Crea los dispositivos iniciales del sistema de medición.
+    Solo crea los que no existen (idempotente).
+    """
+    dispositivos_seed = [
+        {
+            "device_id": "ESP32-001",
+            "nombre": "Medidor Principal - Lab IoT",
+            "ubicacion": "Laboratorio IoT - Edificio 67",
+            "descripcion": "Medidor principal del laboratorio de IoT, conectado al tablero eléctrico principal. ADE9153A + SIM7080G.",
+            "firmware_version": "1.0.0",
+            "intervalo_medicion": 60,
+        },
+        {
+            "device_id": "ESP32-002",
+            "nombre": "Medidor Secundario - Oficina",
+            "ubicacion": "Oficina de Investigación - Edificio 67",
+            "descripcion": "Medidor secundario para monitoreo de consumo en oficina de investigación.",
+            "firmware_version": "1.0.0",
+            "intervalo_medicion": 60,
+        },
+        {
+            "device_id": "ESP32-003",
+            "nombre": "Medidor Pruebas - Banco de trabajo",
+            "ubicacion": "Banco de pruebas - Laboratorio",
+            "descripcion": "Medidor de pruebas para validación de firmware y calibración.",
+            "firmware_version": "1.0.0",
+            "intervalo_medicion": 30,
+        },
+    ]
+
+    creados = []
+    existentes = []
+
+    for data in dispositivos_seed:
+        existente = db.query(Dispositivo).filter(
+            Dispositivo.device_id == data["device_id"]
+        ).first()
+
+        if existente:
+            existentes.append(data["device_id"])
+            continue
+
+        nuevo = Dispositivo(
+            device_id=data["device_id"],
+            nombre=data["nombre"],
+            ubicacion=data["ubicacion"],
+            descripcion=data["descripcion"],
+            firmware_version=data["firmware_version"],
+            intervalo_medicion=data["intervalo_medicion"],
+            activo=True,
+            conectado=False,
+        )
+        db.add(nuevo)
+        creados.append(data["device_id"])
+
+    if creados:
+        db.commit()
+
+    return {
+        "mensaje": f"Seed completado: {len(creados)} creados, {len(existentes)} ya existían",
+        "creados": creados,
+        "existentes": existentes,
+    }
+
+
+@router.post("/seed-mediciones-demo")
+def seed_mediciones_demo(db: Session = Depends(get_db)):
+    """
+    Genera mediciones demo para los dispositivos existentes.
+    Útil para verificar que gráficas y tablas funcionen correctamente.
+    Crea 24 mediciones (una por hora) para cada dispositivo.
+    """
+    import random
+    from datetime import timedelta
+
+    dispositivos = db.query(Dispositivo).filter(Dispositivo.activo == True).all()
+    if not dispositivos:
+        return {"mensaje": "No hay dispositivos. Ejecuta /admin/seed primero.", "mediciones_creadas": 0}
+
+    total_creadas = 0
+    ahora = datetime.now(timezone.utc)
+
+    for disp in dispositivos:
+        # Verificar si ya tiene mediciones recientes (últimas 24h)
+        mediciones_existentes = db.query(Medicion).filter(
+            Medicion.device_id == disp.device_id,
+            Medicion.timestamp >= ahora - timedelta(hours=24),
+        ).count()
+
+        if mediciones_existentes >= 20:
+            continue  # Ya tiene suficientes datos
+
+        # Base values para cada dispositivo (ligeramente diferentes)
+        base_voltage = 118.0 + random.uniform(-3, 5)
+        base_current = 0.12 + random.uniform(0, 0.08)
+
+        for i in range(24):
+            hora = ahora - timedelta(hours=23 - i)
+
+            # Simular variación horaria (más consumo en horas de trabajo)
+            hour_of_day = hora.hour
+            if 8 <= hour_of_day <= 18:
+                load_factor = 1.0 + random.uniform(0, 0.5)
+            elif 6 <= hour_of_day <= 22:
+                load_factor = 0.6 + random.uniform(0, 0.3)
+            else:
+                load_factor = 0.2 + random.uniform(0, 0.2)
+
+            voltage = base_voltage + random.uniform(-2, 2)
+            current = base_current * load_factor + random.uniform(-0.02, 0.02)
+            current = max(0.01, current)
+            power = voltage * current
+            pf = 0.92 + random.uniform(0, 0.08)
+            freq = 59.9 + random.uniform(0, 0.2)
+            energy = power * (1 / 60)  # Wh en 1 minuto
+
+            medicion = Medicion(
+                dispositivo_id=disp.id,
+                device_id=disp.device_id,
+                voltaje_rms=round(voltage, 2),
+                corriente_rms=round(current, 4),
+                potencia_activa=round(power, 2),
+                potencia_reactiva=round(power * 0.1, 2),
+                potencia_aparente=round(power / pf, 2),
+                factor_potencia=round(pf, 3),
+                frecuencia=round(freq, 2),
+                energia_activa=round(energy, 4),
+                energia_reactiva=round(energy * 0.05, 4),
+                timestamp=hora,
+            )
+            db.add(medicion)
+            total_creadas += 1
+
+        # Actualizar estado del dispositivo
+        disp.conectado = True
+        disp.ultima_conexion = ahora
+
+    db.commit()
+
+    return {
+        "mensaje": f"Demo completado: {total_creadas} mediciones creadas para {len(dispositivos)} dispositivos",
+        "mediciones_creadas": total_creadas,
+        "dispositivos": [d.device_id for d in dispositivos],
+    }
+
+
+@router.post("/limpiar-dispositivos")
+def limpiar_dispositivos(db: Session = Depends(get_db)):
+    """
+    Limpia dispositivos basura (auto-registrados por error) y actualiza
+    los nombres/ubicaciones de los dispositivos reales.
+    """
+    # Dispositivos a eliminar (basura)
+    ids_eliminar = ["STRING", "ESP32-TEST-001"]
+    eliminados = []
+
+    for device_id in ids_eliminar:
+        disp = db.query(Dispositivo).filter(Dispositivo.device_id == device_id).first()
+        if disp:
+            # Eliminar mediciones asociadas primero
+            db.query(Medicion).filter(Medicion.device_id == device_id).delete()
+            db.delete(disp)
+            eliminados.append(device_id)
+
+    # Actualizar datos de dispositivos reales
+    actualizaciones = {
+        "ESP32-001": {
+            "nombre": "Medidor Principal - Lab IoT",
+            "ubicacion": "Laboratorio IoT - Edificio 67, Bogotá",
+            "descripcion": "Medidor principal conectado al tablero eléctrico. ADE9153A + SIM7080G.",
+        },
+        "ESP32-002": {
+            "nombre": "Medidor Secundario - Casa Cristian",
+            "ubicacion": "Bogotá, Colombia",
+            "descripcion": "Medidor de consumo residencial para pruebas de campo.",
+        },
+        "ESP32-003": {
+            "nombre": "Medidor Pruebas - Banco de trabajo",
+            "ubicacion": "Bogotá, Colombia",
+            "descripcion": "Medidor para validación de firmware y calibración.",
+        },
+    }
+
+    actualizados = []
+    for device_id, datos in actualizaciones.items():
+        disp = db.query(Dispositivo).filter(Dispositivo.device_id == device_id).first()
+        if disp:
+            disp.nombre = datos["nombre"]
+            disp.ubicacion = datos["ubicacion"]
+            disp.descripcion = datos["descripcion"]
+            actualizados.append(device_id)
+
+    db.commit()
+
+    return {
+        "mensaje": f"Limpieza completada: {len(eliminados)} eliminados, {len(actualizados)} actualizados",
+        "eliminados": eliminados,
+        "actualizados": actualizados,
+    }
+
+
+@router.post("/cerrar-alarmas-antiguas")
+def cerrar_alarmas_antiguas(
+    request: Request,
+    hasta: datetime = Query(..., description="Cierra las alarmas activas con timestamp anterior a esta fecha (UTC)"),
+    device_id: Optional[str] = Query(None, description="Limitar a un medidor"),
+    confirmar: bool = Query(False, description="Sin confirmar solo cuenta (simulación)"),
+    db: Session = Depends(get_db),
+    usuario: Usuario = Depends(get_current_user),
+):
+    """
+    Cierre administrativo de alarmas activas antiguas, sin borrarlas.
+
+    Para condiciones que quedaron abiertas en datos históricos (p. ej. alertas
+    de firmware sin evento de recuperación). Quedan con activo=False, fin_at =
+    hora del cierre (no la del fin real, que se desconoce) y reconocidas por el
+    usuario. La acción se registra en la auditoría con los ids cerrados.
+    """
+    if hasta.tzinfo is None:
+        hasta = hasta.replace(tzinfo=timezone.utc)
+    q = db.query(Evento).filter(Evento.activo == True, Evento.timestamp < hasta)  # noqa: E712
+    if device_id:
+        q = q.filter(Evento.device_id == device_id.strip().upper())
+    eventos = q.order_by(Evento.timestamp.asc(), Evento.id.asc()).all()
+
+    resumen = {
+        "hasta": hasta.isoformat(),
+        "device_id": device_id,
+        "total": len(eventos),
+        "por_tipo": dict(Counter(f"{e.device_id}:{e.tipo}" for e in eventos)),
+        "primera": eventos[0].timestamp.isoformat() if eventos else None,
+        "ultima": eventos[-1].timestamp.isoformat() if eventos else None,
+    }
+    if not confirmar:
+        return {"simulacion": True, **resumen}
+
+    ahora = datetime.now(timezone.utc)
+    for e in eventos:
+        e.activo = False
+        e.fin_at = ahora
+        if e.reconocido_at is None:
+            e.reconocido_por = usuario.email
+            e.reconocido_at = ahora
+    db.commit()
+
+    registrar_accion(
+        db, accion="alarmas_cerradas_admin", usuario_email=usuario.email,
+        recurso="evento", recurso_id=None,
+        detalles={**resumen, "ids": [e.id for e in eventos],
+                  "nota": "cierre administrativo; fin_at es la hora del cierre"},
+        ip_address=request.client.host if request.client else None,
+    )
+    return {"simulacion": False, "cerradas": len(eventos), **resumen}
+
+
+@router.post("/reset-datos")
+def reset_datos(
+    token: str = Query(..., description="Token de confirmacion (variable de entorno RESET_TOKEN)"),
+    db: Session = Depends(get_db),
+    _usuario: Usuario = Depends(get_current_user),
+):
+    """
+    Borra todas las mediciones, registros de salud, eventos y audit_log.
+    Preserva dispositivos y usuarios.
+    Requiere token de confirmacion para evitar ejecucion accidental.
+    """
+    if not _RESET_TOKEN or token != _RESET_TOKEN:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=403, detail="Token de confirmacion incorrecto")
+
+    conteos = {}
+
+    conteos["audit_log"] = db.query(AuditLog).count()
+    db.query(AuditLog).delete()
+
+    conteos["eventos"] = db.query(Evento).count()
+    db.query(Evento).delete()
+
+    conteos["nodo_salud"] = db.query(NodoSalud).count()
+    db.query(NodoSalud).delete()
+
+    conteos["mediciones"] = db.query(Medicion).count()
+    db.query(Medicion).delete()
+
+    # Resetear estado de conectividad de todos los dispositivos
+    dispositivos = db.query(Dispositivo).all()
+    for d in dispositivos:
+        d.conectado = False
+        d.ultima_conexion = None
+
+    db.commit()
+
+    return {
+        "mensaje": "Reset completado. El sistema esta listo para captura de datos limpia.",
+        "registros_eliminados": conteos,
+        "dispositivos_reseteados": len(dispositivos),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
