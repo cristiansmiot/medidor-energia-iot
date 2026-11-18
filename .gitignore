@@ -1,0 +1,38 @@
+# Credenciales y variables locales
+firmware/config/secrets.h
+.env
+.env.*
+!.env.example
+
+# Firmware (PlatformIO / ESP-IDF)
+firmware/.pio/
+firmware/build/
+firmware/sdkconfig
+firmware/sdkconfig.old
+firmware/dependencies.lock
+firmware/managed_components/
+
+# Backend
+__pycache__/
+*.pyc
+venv/
+.venv/
+*.db
+*.sqlite3
+
+# Frontend
+node_modules/
+dist/
+
+# Certificados del broker
+broker/certs/*.crt
+broker/certs/*.key
+broker/certs/*.srl
+broker/certs/*.csr
+broker/passwd
+
+# Sistema y editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

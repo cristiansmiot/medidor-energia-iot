@@ -1,0 +1,30 @@
+cff-version: 1.2.0
+message: "Si usa este trabajo, cítelo de esta forma."
+title: "Sistema de medición de energía eléctrica para el sector residencial basado en tecnologías del Internet de las cosas"
+type: software
+authors:
+  - family-names: "Mendivelso Romero"
+    given-names: "Cristian Leonardo"
+    affiliation: "Pontificia Universidad Javeriana"
+repository-code: "https://github.com/cristiansmiot/medidor-energia-iot"
+license: MIT
+keywords:
+  - medición inteligente
+  - Internet de las cosas
+  - LTE-M
+  - MQTT
+  - SenML
+  - ADE9153A
+  - ESP32-S3
+references:
+  - type: thesis
+    title: "Sistema de medición de energía eléctrica para el sector residencial basado en tecnologías del Internet de las cosas"
+    authors:
+      - family-names: "Mendivelso Romero"
+        given-names: "Cristian Leonardo"
+    thesis-type: "Trabajo de grado de maestría"
+    institution:
+      name: "Pontificia Universidad Javeriana, Maestría en Ingeniería del Internet de las Cosas"
+      city: "Bogotá"
+      country: CO
+    year: 2026
