@@ -1,0 +1,46 @@
+#ifndef RTOS_APP_CONFIG_H
+#define RTOS_APP_CONFIG_H
+
+// Prioridades de tareas
+#define TASK_PRIO_MEASUREMENT    5
+#define TASK_PRIO_POWER_QUALITY  4
+#define TASK_PRIO_CALIBRATION    3
+#define TASK_PRIO_COMMUNICATION  2
+#define TASK_PRIO_UI             1
+#define TASK_PRIO_POWER_MGMT     1
+#define TASK_PRIO_SYSTEM_EVENTS  3
+#define TASK_PRIO_TIME           2
+#define TASK_PRIO_STORAGE        2
+// El supervisor corre por encima de todas: si una tarea de mayor prioridad
+// entra en busy-loop, un supervisor de prioridad baja jamas ejecutaria.
+#define TASK_PRIO_SUPERVISOR     6
+
+// Stack sizes en bytes (ESP-IDF xTaskCreate). El dispatcher serializa eventos
+// a JSON/SenML y necesita margen para buffers locales y llamadas anidadas.
+#define TASK_STACK_MEASUREMENT   4096
+#define TASK_STACK_CALIBRATION   8192
+#define TASK_STACK_PQ            4096
+#define TASK_STACK_COMM          8192
+#define TASK_STACK_UI            5120
+#define TASK_STACK_POWER_MGMT    4096
+#define TASK_STACK_SUPERVISOR    3072
+#define TASK_STACK_SYSTEM_EVENTS 8192
+#define TASK_STACK_TIME          3072
+#define TASK_STACK_STORAGE       8192
+
+// Longitudes de queues
+#define QUEUE_METER_EVENTS_LEN   16
+#define QUEUE_CALIB_REQUEST_LEN  4
+#define QUEUE_PQ_ALERTS_LEN      16
+
+// Feature flags de Sprint 1+
+// 0 = no publicar eventos en q_meter_events
+// 1 = publicar eventos para consumidores como la UI
+#define FEATURE_METER_EVENTS_PUBLISH 1
+
+// Timeouts
+#define TIMEOUT_MUTEX_MS         10
+#define TIMEOUT_QUEUE_SEND_MS    0
+#define TIMEOUT_CALIB_TOTAL_MS   60000
+
+#endif // RTOS_APP_CONFIG_H

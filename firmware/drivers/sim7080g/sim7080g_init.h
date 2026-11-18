@@ -1,0 +1,165 @@
+#ifndef SIM7080G_INIT_H
+#define SIM7080G_INIT_H
+
+/**
+ * @file sim7080g_init.h
+ * @brief SIM7080G Init - Sprint 3
+ * Responsabilidad: SIM7080G modem bring-up entry point.
+ * Interfaz de hardware: UART
+ * Protocolo: AT commands
+ * Integracion prevista:
+ *   - task_communication will call sim7080g_init.
+ *   - Flujo de datos: meter_data_get_snapshot() -> MeterData_t
+ * Pines reservados en board_config.h: SIM7080G UART1 TX=16 RX=17
+ */
+
+#include <stdbool.h>
+#include <stdint.h>
+#include <time.h>
+#include "esp_err.h"
+
+#define SIM7080G_STATE_MODEM_READY   (1U << 0)
+#define SIM7080G_STATE_NETWORK_READY (1U << 1)
+#define SIM7080G_STATE_PDP_READY     (1U << 2)
+#define SIM7080G_STATE_ERROR         (1U << 7)
+
+/**
+ * @brief Inicializa modem SIM7080G y valida enlace AT.
+ * @return ESP_OK en caso de exito.
+ */
+esp_err_t sim7080g_init(void);
+
+/**
+ * @brief Espera registro de red (CEREG/CGREG stat=1/5).
+ * @param timeout_ms Timeout total.
+ * @return ESP_OK si registro exitoso.
+ */
+esp_err_t sim7080g_wait_network(uint32_t timeout_ms);
+
+/**
+ * @brief Activa PDP con APN configurado y valida estado.
+ * @return ESP_OK en caso de exito.
+ */
+esp_err_t sim7080g_activate_pdp(void);
+
+/**
+ * @brief Flujo compacto de recuperacion de conectividad (red + PDP).
+ * @return ESP_OK en caso de exito.
+ */
+esp_err_t sim7080g_recover_network(void);
+
+/**
+ * @brief Cicla el contexto PDP (desactiva → 2s → reactiva).
+ * Necesario cuando AT+SMDISC falla con "operation not allowed":
+ * libera la sesion TCP subyacente para que MQTT pueda reconectar.
+ * @return ESP_OK si el contexto se reactivó correctamente.
+ */
+esp_err_t sim7080g_cycle_pdp(void);
+
+/**
+ * @brief Verifica estado runtime de red+attach+PDP consultando AT.
+ * @return ESP_OK si red y PDP siguen listos.
+ */
+esp_err_t sim7080g_refresh_runtime_state(void);
+
+/**
+ * @brief Obtiene mascara de estado interna.
+ * @return Bits SIM7080G_STATE_*.
+ */
+uint8_t sim7080g_get_state(void);
+
+/**
+ * @brief Verifica disponibilidad del modem.
+ * @return true si modem esta listo.
+ */
+bool sim7080g_is_modem_ready(void);
+
+/**
+ * @brief Verifica si la red celular esta lista.
+ * @return true si hay registro de red.
+ */
+bool sim7080g_is_network_ready(void);
+
+/**
+ * @brief Verifica si el contexto PDP esta activo.
+ * @return true si PDP esta activo.
+ */
+bool sim7080g_is_pdp_ready(void);
+
+/**
+ * Indica si el ultimo intento de inicializacion obtuvo alguna respuesta AT.
+ * Permite distinguir un modem apagado/sin UART de errores posteriores como
+ * SIM no lista, falta de servicio o PDP caido.
+ */
+bool sim7080g_last_at_response_ok(void);
+
+/**
+ * Indica que el ultimo intento no obtuvo AT pero el modem respondio por UART
+ * dentro de METER_SIM7080G_BUSY_GRACE_MS: esta ocupado, no apagado. No debe
+ * tratarse como SIM_NO_AT ni disparar PWRKEY.
+ */
+bool sim7080g_is_modem_busy(void);
+
+/**
+ * @brief Fuerza reset de estado interno modem/UART para re-probe completo.
+ */
+void sim7080g_mark_modem_unready(void);
+
+/**
+ * @brief Obtiene APN en uso (auto-detectado o configurado).
+ * @return APN actual.
+ */
+const char *sim7080g_get_apn(void);
+
+/**
+ * @brief Lee el IMEI del SIM7080G via AT+GSN y lo almacena internamente.
+ * @return ESP_OK si se obtuvo un IMEI de 15 dígitos.
+ */
+esp_err_t sim7080g_read_imei(void);
+
+/**
+ * @brief Retorna el IMEI leído (cadena vacía si aún no se leyó).
+ */
+const char *sim7080g_get_imei(void);
+
+/**
+ * @brief Solicita fecha/hora de la red via AT+CCLK? y la almacena internamente.
+ * @return ESP_OK si se obtuvo hora valida.
+ */
+esp_err_t sim7080g_sync_network_time(void);
+
+/* ── rc4: escalera de recuperacion celular ──────────────────────────────
+ * Las acciones bloquean la tarea que llama (hasta ~1 min) y dejan el modem
+ * para reinicializar en la siguiente vuelta del ciclo de comunicaciones. */
+
+/** Ultimo <stat> de CEREG/CGREG (-1 sin dato; 0 no busca; 2 busca; 3 denegado). */
+int sim7080g_get_reg_stat(void);
+
+/** N1: AT+CFUN=4 (solo radio), 3 s, AT+CFUN=1 y espera CPIN READY. */
+esp_err_t sim7080g_radio_reattach(void);
+
+/** N2: AT+CFUN=1,1 (reinicio del modem) y espera a que vuelva a contestar AT. */
+esp_err_t sim7080g_soft_reset(void);
+
+/**
+ * Sonda del plano de datos con el PDP activo: ping (AT+SNPING4) y, si no
+ * responde, resolucion DNS. ESP_OK si alguna responde. detail resume el
+ * resultado para el evento (<= 47 caracteres).
+ */
+esp_err_t sim7080g_data_probe(char *detail, size_t detail_len);
+
+/**
+ * @brief Obtiene la ultima fecha/hora sincronizada desde la red.
+ * @return Cadena "YYYY-MM-DD HH:MM" o cadena vacia si no disponible.
+ */
+const char *sim7080g_get_network_time(void);
+
+/**
+ * @brief Epoch UTC capturado en la ultima sincronizacion AT+CCLK.
+ * @return Segundos desde 1970, o 0 si nunca se sincronizo.
+ */
+time_t sim7080g_get_network_epoch(void);
+
+#endif // SIM7080G_INIT_H
+
+

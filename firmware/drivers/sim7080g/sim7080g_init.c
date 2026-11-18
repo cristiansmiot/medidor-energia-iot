@@ -1,0 +1,1429 @@
+﻿#include "sim7080g_init.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include "board_config.h"
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "meter_config.h"
+#include "sim7080g_hal.h"
+#include "nvs.h"
+#include "nvs_flash.h"
+#include "logger.h"
+
+static const char *TAG = "sim7080g_init";
+static uint8_t s_state;
+static uint32_t s_detected_baudrate;
+// Ultimo baud al que se obtuvo respuesta AT (persistido en NVS).
+// Se preserva a traves de resets de s_detected_baudrate para que el
+// proximo probe lo intente primero con timeout agresivo y evite el scan
+// completo (~22 s) tras caidas de MQTT.
+static uint32_t s_last_known_baud;
+static uint8_t s_health_fail_streak;
+static bool s_last_at_response_ok;
+// rc4: ultimo <stat> de CEREG (o CGREG si CEREG no respondio); -1 = sin dato.
+// 0 no registrado ni buscando, 1 local, 2 buscando, 3 denegado, 5 roaming.
+static int s_last_reg_stat = -1;
+// true cuando el modem no contesta AT pero respondio por UART hace menos de
+// METER_SIM7080G_BUSY_GRACE_MS: esta ocupado, no apagado.
+static bool s_modem_busy;
+static char s_runtime_apn[64];
+static char s_imei[20];        // 15 dígitos IMEI + '\0', leído con AT+GSN
+static const uint32_t k_probe_at_timeout_ms = 1500U;
+// Timeout corto para el "quick-AT" contra el baud cacheado antes de lanzar
+// el probe completo. Con el modem ya a 57600 responde en <200 ms.
+static const uint32_t k_quick_at_timeout_ms = 500U;
+
+// Namespace y claves NVS para persistir el baud detectado.
+#define SIM7080G_NVS_NAMESPACE  "sim7080g"
+#define SIM7080G_NVS_KEY_BAUD   "baud"
+static const uint32_t k_network_query_timeout_ms = 1500U;
+static const uint32_t k_runtime_query_timeout_ms = 1000U;
+static const uint32_t k_sim_ready_timeout_ms = 30000U;
+static const uint8_t k_health_fail_force_reprobe = 1U;
+
+#define AT_BASIC            "AT"
+#define AT_ECHO_OFF         "ATE0"
+#define AT_CMEE_ON          "AT+CMEE=2"
+#define AT_CPIN_QUERY       "AT+CPIN?"
+#define AT_CSQ_QUERY        "AT+CSQ"
+#define AT_CNMP_FMT         "AT+CNMP=%u"
+#define AT_CNMP_QUERY       "AT+CNMP?"
+#define AT_CMNB_FMT         "AT+CMNB=%u"
+#define AT_CMNB_QUERY       "AT+CMNB?"
+#define AT_IFC_NONE         "AT+IFC=0,0"
+#define AT_CSCLK_OFF        "AT+CSCLK=0"
+#define AT_CPSMS_OFF        "AT+CPSMS=0"
+#define AT_CEDRXS_OFF       "AT+CEDRXS=0"
+#define AT_CEREG_QUERY      "AT+CEREG?"
+#define AT_CGREG_QUERY      "AT+CGREG?"
+#define AT_CGATT_QUERY      "AT+CGATT?"
+#define AT_CGATT_ATTACH     "AT+CGATT=1"
+#define AT_CGDCONT_FMT      "AT+CGDCONT=%u,\"IP\",\"%s\""
+#define AT_CNCFG_FMT        "AT+CNCFG=%u,1,\"%s\""
+#define AT_CNACT_ON_FMT     "AT+CNACT=%u,1"
+#define AT_CNACT_OFF_FMT    "AT+CNACT=%u,0"
+#define AT_CNACT_QUERY      "AT+CNACT?"
+#define AT_CGNAPN_QUERY     "AT+CGNAPN"
+#define AT_CPSI_QUERY       "AT+CPSI?"
+#define AT_CEER_QUERY       "AT+CEER"
+#define AT_IPR_FMT          "AT+IPR=%lu"
+
+static const uint32_t k_sim7080g_baud_candidates[] = {
+    SIM7080G_BAUD_RATE,
+#if (METER_SIM7080G_BAUD_AUTOPROBE != 0)
+    115200U,
+    9600U,
+    38400U,
+    19200U
+#endif
+};
+
+static int sim7080g_response_reg_stat(const char *response, const char *prefix)
+{
+    if ((response == NULL) || (prefix == NULL)) {
+        return -1;
+    }
+    const char *line = strstr(response, prefix);
+    if (line == NULL) {
+        return -1;
+    }
+    const char *comma = strchr(line, ',');
+    if (comma == NULL) {
+        return -1;
+    }
+    return atoi(comma + 1);
+}
+
+static const char *sim7080g_select_apn(void)
+{
+    return (s_runtime_apn[0] != '\0') ? s_runtime_apn : METER_SIM7080G_APN;
+}
+
+// ------------------------------------------------------------------
+// Persistencia del ultimo baud conocido en NVS.
+// Asume nvs_flash_init() ya invocado (lo hace nvm_calib_init en el boot).
+// Si NVS no esta listo las funciones degradan silenciosamente: el probe
+// completo sigue funcionando.
+// ------------------------------------------------------------------
+static esp_err_t sim7080g_baud_nvs_load(uint32_t *out_baud)
+{
+    if (out_baud == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(SIM7080G_NVS_NAMESPACE, NVS_READONLY, &h);
+    if (err != ESP_OK) {
+        return err;
+    }
+    uint32_t val = 0U;
+    err = nvs_get_u32(h, SIM7080G_NVS_KEY_BAUD, &val);
+    nvs_close(h);
+    if (err == ESP_OK) {
+        *out_baud = val;
+    }
+    return err;
+}
+
+static void sim7080g_baud_nvs_save(uint32_t baud)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(SIM7080G_NVS_NAMESPACE, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        LOG_WARN(TAG, "nvs_open(%s) rw failed: %s", SIM7080G_NVS_NAMESPACE,
+                 esp_err_to_name(err));
+        return;
+    }
+    err = nvs_set_u32(h, SIM7080G_NVS_KEY_BAUD, baud);
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    if (err != ESP_OK) {
+        LOG_WARN(TAG, "nvs baud save failed: %s", esp_err_to_name(err));
+    }
+    nvs_close(h);
+}
+
+// Intenta un AT rapido contra un baud especifico. Si responde, deja la HAL
+// configurada en ese baud y devuelve ESP_OK. Usada para evitar el scan
+// completo cuando ya conocemos el baud del modem.
+static esp_err_t sim7080g_try_baud_quick(uint32_t baud)
+{
+    const sim7080g_hal_config_t cfg = {
+        .uart_num = SIM7080G_UART_NUM,
+        .tx_pin   = SIM7080G_UART_TX,
+        .rx_pin   = SIM7080G_UART_RX,
+        .baudrate = baud,
+    };
+    esp_err_t err = sim7080g_hal_init(&cfg);
+    if (err != ESP_OK) {
+        return err;
+    }
+    return sim7080g_hal_send_cmd(AT_BASIC, NULL, NULL, 0U,
+                                 k_quick_at_timeout_ms, 1U);
+}
+
+static esp_err_t sim7080g_query_network_registration(char *response,
+                                                     size_t response_len,
+                                                     const char **source_out)
+{
+    static const struct {
+        const char *cmd;
+        const char *prefix;
+        const char *label;
+    } k_queries[] = {
+        { AT_CEREG_QUERY, "+CEREG:", "CEREG" },
+        { AT_CGREG_QUERY, "+CGREG:", "CGREG" }
+    };
+
+    esp_err_t last_err = ESP_FAIL;
+    bool got_reply = false;
+    int round_stat = -1;
+
+    for (size_t i = 0U; i < (sizeof(k_queries) / sizeof(k_queries[0])); ++i) {
+        if ((response != NULL) && (response_len > 0U)) {
+            response[0] = '\0';
+        }
+
+        const esp_err_t err = sim7080g_hal_send_cmd(k_queries[i].cmd,
+                                                    NULL,
+                                                    response,
+                                                    response_len,
+                                                    k_network_query_timeout_ms,
+                                                    1U);
+        if (err != ESP_OK) {
+            last_err = err;
+            continue;
+        }
+
+        got_reply = true;
+        const int stat = sim7080g_response_reg_stat(response, k_queries[i].prefix);
+        if (round_stat < 0) {
+            round_stat = stat;  // CEREG (LTE) tiene prioridad sobre CGREG
+        }
+        if ((stat == 1) || (stat == 5)) {
+            s_last_reg_stat = stat;
+            if (source_out != NULL) {
+                *source_out = k_queries[i].label;
+            }
+            return ESP_OK;
+        }
+        last_err = ESP_ERR_INVALID_STATE;
+    }
+
+    s_last_reg_stat = round_stat;
+    return got_reply ? ESP_ERR_INVALID_STATE : last_err;
+}
+
+static esp_err_t sim7080g_wait_sim_ready(uint32_t timeout_ms)
+{
+    const TickType_t start = xTaskGetTickCount();
+    const TickType_t timeout_ticks = pdMS_TO_TICKS(timeout_ms);
+    char response[256];
+    char last_response[256];
+    esp_err_t last_err = ESP_ERR_TIMEOUT;
+
+    last_response[0] = '\0';
+    while ((xTaskGetTickCount() - start) < timeout_ticks) {
+        response[0] = '\0';
+        last_err = sim7080g_hal_send_cmd(AT_CPIN_QUERY,
+                                         NULL,
+                                         response,
+                                         sizeof(response),
+                                         METER_SIM7080G_AT_TIMEOUT_MS,
+                                         1U);
+        if ((last_err == ESP_OK) && (strstr(response, "+CPIN: READY") != NULL)) {
+            return ESP_OK;
+        }
+
+        if (response[0] != '\0') {
+            (void)strncpy(last_response, response, sizeof(last_response) - 1U);
+            last_response[sizeof(last_response) - 1U] = '\0';
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000U));
+    }
+
+    if (last_response[0] != '\0') {
+        LOG_WARN(TAG, "SIM not ready after wait. last_resp=%s", last_response);
+    } else {
+        LOG_WARN(TAG, "SIM not ready after wait. last_err=%s", esp_err_to_name(last_err));
+    }
+    return (last_err == ESP_OK) ? ESP_FAIL : last_err;
+}
+
+static int sim7080g_response_pdp_status_for_cid(const char *response, uint8_t cid)
+{
+    if (response == NULL) {
+        return -1;
+    }
+
+    const char *line = response;
+    while ((line = strstr(line, "+CNACT:")) != NULL) {
+        int response_cid = -1;
+        int status = -1;
+        if (sscanf(line + strlen("+CNACT:"), " %d,%d", &response_cid, &status) == 2 &&
+            response_cid == (int)cid) {
+            return status;
+        }
+        line += strlen("+CNACT:");
+    }
+    return -1;
+}
+
+static bool sim7080g_response_pdp_ready_for_cid(const char *response, uint8_t cid)
+{
+    return sim7080g_response_pdp_status_for_cid(response, cid) == 1;
+}
+
+static bool sim7080g_response_attached(const char *response)
+{
+    if (response == NULL) {
+        return false;
+    }
+    return (strstr(response, "+CGATT: 1") != NULL) ||
+           (strstr(response, "+CGATT:1") != NULL);
+}
+
+static void sim7080g_log_ceer(void)
+{
+    char response[256];
+    response[0] = '\0';
+    const esp_err_t err = sim7080g_hal_send_cmd(AT_CEER_QUERY,
+                                                NULL,
+                                                response,
+                                                sizeof(response),
+                                                METER_SIM7080G_AT_TIMEOUT_MS,
+                                                1U);
+    if ((err == ESP_OK) && (response[0] != '\0')) {
+        LOG_WARN(TAG, "CEER=%s", response);
+    } else if (err == ESP_OK) {
+        LOG_WARN(TAG, "CEER query ok (empty response)");
+    } else {
+        LOG_WARN(TAG, "CEER query failed: %s", esp_err_to_name(err));
+    }
+}
+
+static esp_err_t sim7080g_refresh_runtime_apn(void)
+{
+#if (METER_SIM7080G_AUTO_APN_QUERY == 0)
+    return ESP_OK;
+#else
+    char response[256];
+    response[0] = '\0';
+
+    const esp_err_t err = sim7080g_hal_send_cmd(AT_CGNAPN_QUERY,
+                                                NULL,
+                                                response,
+                                                sizeof(response),
+                                                METER_SIM7080G_AT_TIMEOUT_MS,
+                                                1U);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    const char *first_quote = strchr(response, '"');
+    if (first_quote == NULL) {
+        return ESP_FAIL;
+    }
+    const char *second_quote = strchr(first_quote + 1, '"');
+    if (second_quote == NULL) {
+        return ESP_FAIL;
+    }
+
+    const size_t apn_len = (size_t)(second_quote - first_quote - 1);
+    if ((apn_len == 0U) || (apn_len >= sizeof(s_runtime_apn))) {
+        return ESP_FAIL;
+    }
+
+    char detected_apn[sizeof(s_runtime_apn)];
+    (void)memcpy(detected_apn, first_quote + 1, apn_len);
+    detected_apn[apn_len] = '\0';
+
+    if (strcmp(s_runtime_apn, detected_apn) != 0) {
+        (void)strncpy(s_runtime_apn, detected_apn, sizeof(s_runtime_apn) - 1U);
+        s_runtime_apn[sizeof(s_runtime_apn) - 1U] = '\0';
+        LOG_INFO(TAG, "APN detectado por red: %s", s_runtime_apn);
+    }
+
+    return ESP_OK;
+#endif
+}
+
+static void sim7080g_log_radio_info(void)
+{
+    char response[256];
+    response[0] = '\0';
+    const esp_err_t err = sim7080g_hal_send_cmd(AT_CPSI_QUERY,
+                                                NULL,
+                                                response,
+                                                sizeof(response),
+                                                1500U,
+                                                1U);
+    if ((err == ESP_OK) && (response[0] != '\0')) {
+        LOG_INFO(TAG, "CPSI=%s", response);
+    }
+}
+
+static esp_err_t sim7080g_ensure_ps_attach(void)
+{
+    char response[256];
+    esp_err_t err = sim7080g_hal_send_cmd(AT_CGATT_QUERY,
+                                          NULL,
+                                          response,
+                                          sizeof(response),
+                                          METER_SIM7080G_AT_TIMEOUT_MS,
+                                          METER_SIM7080G_MAX_RETRIES);
+    if ((err == ESP_OK) && sim7080g_response_attached(response)) {
+        return ESP_OK;
+    }
+
+    LOG_WARN(TAG, "PS not attached, trying attach (CGATT=1). resp=%s", response);
+    err = sim7080g_hal_send_cmd(AT_CGATT_ATTACH,
+                                NULL,
+                                response,
+                                sizeof(response),
+                                15000U,
+                                METER_SIM7080G_MAX_RETRIES);
+    if (err != ESP_OK) {
+        LOG_WARN(TAG, "CGATT attach failed. resp=%s", response);
+        return err;
+    }
+
+    const TickType_t start = xTaskGetTickCount();
+    const TickType_t timeout_ticks = pdMS_TO_TICKS(30000U);
+    while ((xTaskGetTickCount() - start) < timeout_ticks) {
+        response[0] = '\0';
+        err = sim7080g_hal_send_cmd(AT_CGATT_QUERY,
+                                    NULL,
+                                    response,
+                                    sizeof(response),
+                                    METER_SIM7080G_AT_TIMEOUT_MS,
+                                    1U);
+        if ((err == ESP_OK) && sim7080g_response_attached(response)) {
+            return ESP_OK;
+        }
+        vTaskDelay(pdMS_TO_TICKS(2000U));
+    }
+
+    LOG_WARN(TAG, "CGATT did not reach attached state. last_resp=%s", response);
+    return ESP_ERR_TIMEOUT;
+}
+
+static esp_err_t sim7080g_activate_pdp_cid(uint8_t cid)
+{
+    char cmd[96];
+    char response[256];
+
+    // Evita reactivar PDP si ya esta arriba.
+    response[0] = '\0';
+    esp_err_t err = sim7080g_hal_send_cmd(AT_CNACT_QUERY,
+                                          NULL,
+                                          response,
+                                          sizeof(response),
+                                          METER_SIM7080G_AT_TIMEOUT_MS,
+                                          1U);
+    if ((err == ESP_OK) && sim7080g_response_pdp_ready_for_cid(response, cid)) {
+        return ESP_OK;
+    }
+
+    // CGDCONT usa contexto PDP (1..16), distinto del perfil usado por CNACT/CNCFG.
+    (void)snprintf(cmd,
+                   sizeof(cmd),
+                   AT_CGDCONT_FMT,
+                   (unsigned)METER_SIM7080G_PDP_CONTEXT_ID,
+                   sim7080g_select_apn());
+    response[0] = '\0';
+    err = sim7080g_hal_send_cmd(cmd,
+                                NULL,
+                                response,
+                                sizeof(response),
+                                METER_SIM7080G_AT_TIMEOUT_MS,
+                                METER_SIM7080G_MAX_RETRIES);
+    if (err != ESP_OK) {
+        LOG_WARN(TAG,
+                 "CGDCONT context_id=%u failed. resp=%s",
+                 (unsigned)METER_SIM7080G_PDP_CONTEXT_ID,
+                 response);
+        return err;
+    }
+
+    (void)snprintf(cmd, sizeof(cmd), AT_CNCFG_FMT, (unsigned)cid, sim7080g_select_apn());
+    response[0] = '\0';
+    err = sim7080g_hal_send_cmd(cmd,
+                                NULL,
+                                response,
+                                sizeof(response),
+                                METER_SIM7080G_AT_TIMEOUT_MS,
+                                METER_SIM7080G_MAX_RETRIES);
+    if (err != ESP_OK) {
+        // Algunos firmwares no requieren CNCFG y pueden responder ERROR.
+        LOG_WARN(TAG, "CNCFG cid=%u failed (continuing). resp=%s", (unsigned)cid, response);
+    }
+
+    (void)snprintf(cmd, sizeof(cmd), AT_CNACT_ON_FMT, (unsigned)cid);
+    response[0] = '\0';
+    err = sim7080g_hal_send_cmd(cmd,
+                                NULL,
+                                response,
+                                sizeof(response),
+                                15000U,
+                                METER_SIM7080G_MAX_RETRIES);
+    if (err != ESP_OK) {
+        LOG_WARN(TAG, "CNACT cid=%u failed. resp=%s", (unsigned)cid, response);
+
+        // Si el contexto ya esta activo, algunos firmwares devuelven ERROR en CNACT=<cid>,1.
+        response[0] = '\0';
+        const esp_err_t q_err = sim7080g_hal_send_cmd(AT_CNACT_QUERY,
+                                                      NULL,
+                                                      response,
+                                                      sizeof(response),
+                                                      METER_SIM7080G_AT_TIMEOUT_MS,
+                                                      METER_SIM7080G_MAX_RETRIES);
+        if ((q_err == ESP_OK) && sim7080g_response_pdp_ready_for_cid(response, cid)) {
+            LOG_WARN(TAG, "CNACT already active after error. query_resp=%s", response);
+            return ESP_OK;
+        }
+        return err;
+    }
+
+    response[0] = '\0';
+    err = sim7080g_hal_send_cmd(AT_CNACT_QUERY,
+                                NULL,
+                                response,
+                                sizeof(response),
+                                METER_SIM7080G_AT_TIMEOUT_MS,
+                                METER_SIM7080G_MAX_RETRIES);
+    if ((err == ESP_OK) && sim7080g_response_pdp_ready_for_cid(response, cid)) {
+        return ESP_OK;
+    }
+
+    LOG_WARN(TAG, "CNACT query cid=%u not ready. resp=%s", (unsigned)cid, response);
+    return ESP_FAIL;
+}
+
+static bool sim7080g_baud_already_tested(uint32_t baud, size_t tested_count, const uint32_t *tested)
+{
+    for (size_t i = 0U; i < tested_count; ++i) {
+        if (tested[i] == baud) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool sim7080g_mode_already_set(const char *query,
+                                      const char *prefix,
+                                      unsigned expected)
+{
+    char response[64];
+    response[0] = '\0';
+    // expected=NULL: esperar el OK final para tener el valor completo.
+    if (sim7080g_hal_send_cmd(query, NULL, response, sizeof(response),
+                              METER_SIM7080G_AT_TIMEOUT_MS, 1U) != ESP_OK) {
+        return false;
+    }
+    const char *p = strstr(response, prefix);
+    unsigned value = 0U;
+    return (p != NULL) && (sscanf(p + strlen(prefix), " %u", &value) == 1) &&
+           (value == expected);
+}
+
+/*
+ * rc4: politica de operador. COPS se guarda en el modem (AUTO_SAVE), asi que
+ * se verifica en cada inicializacion completa y solo se escribe si difiere:
+ * cada escritura dispara una busqueda y un registro nuevos en la red.
+ */
+static void sim7080g_apply_operator_policy(void)
+{
+    const char *pref = METER_SIM7080G_PREFERRED_PLMN;
+    char response[128];
+
+    // Formato numerico para poder comparar el PLMN leido (no cambia el registro).
+    (void)sim7080g_hal_send_cmd("AT+COPS=3,2", NULL, NULL, 0U,
+                                METER_SIM7080G_AT_TIMEOUT_MS, 1U);
+    response[0] = '\0';
+    if (sim7080g_hal_send_cmd("AT+COPS?", NULL, response, sizeof(response),
+                              METER_SIM7080G_AT_TIMEOUT_MS, 1U) != ESP_OK) {
+        LOG_WARN(TAG, "COPS? sin respuesta; politica de operador omitida");
+        return;
+    }
+    int mode = -1;
+    const char *p = strstr(response, "+COPS:");
+    if (p != NULL) {
+        (void)sscanf(p + strlen("+COPS:"), " %d", &mode);
+    }
+
+    char cmd[48];
+    if (pref[0] == '\0') {
+        if (mode == 0) {
+            return;
+        }
+        (void)snprintf(cmd, sizeof(cmd), "AT+COPS=0");
+    } else {
+        // Tras COPS=4 el modem informa 1 (manual) o 4; si cayo a automatico
+        // por falla del manual informa 0 y se vuelve a pedir el preferido.
+        if (((mode == 1) || (mode == 4)) && (strstr(response, pref) != NULL)) {
+            LOG_INFO(TAG, "operador preferido vigente: %s", response);
+            return;
+        }
+        (void)snprintf(cmd, sizeof(cmd), "AT+COPS=4,2,\"%s\"", pref);
+    }
+
+    LOG_WARN(TAG, "politica de operador: %s (antes: %s)", cmd, response);
+    response[0] = '\0';
+    const esp_err_t err = sim7080g_hal_send_cmd(cmd, NULL, response, sizeof(response),
+                                                METER_SIM7080G_COPS_TIMEOUT_MS, 1U);
+    if (err != ESP_OK) {
+        // Con modo 4 el propio modem pasa a automatico si el manual falla.
+        LOG_WARN(TAG, "%s fallo: %s resp=%s", cmd, esp_err_to_name(err), response);
+    }
+}
+
+static bool sim7080g_within_busy_grace(void)
+{
+    const int64_t last_rx_us = sim7080g_hal_last_rx_us();
+    if (last_rx_us <= 0) {
+        return false;
+    }
+    return (esp_timer_get_time() - last_rx_us) <
+           ((int64_t)METER_SIM7080G_BUSY_GRACE_MS * 1000LL);
+}
+
+static esp_err_t sim7080g_probe_modem(void)
+{
+    // ---- Fast path: quick-AT al ultimo baud conocido ----
+    // Primero probamos s_last_known_baud en RAM (preservado en resets blandos).
+    // Si no hay, cargamos el valor persistido en NVS. Evita un scan completo
+    // de ~22 s cuando el modem sigue respondiendo pero la sesion MQTT cayo.
+    if (s_last_known_baud == 0U) {
+        uint32_t nvs_baud = 0U;
+        if (sim7080g_baud_nvs_load(&nvs_baud) == ESP_OK && nvs_baud != 0U) {
+            s_last_known_baud = nvs_baud;
+            LOG_INFO(TAG, "baud cargado desde NVS: %lu", (unsigned long)nvs_baud);
+        }
+    }
+    if (s_last_known_baud != 0U) {
+        if (sim7080g_try_baud_quick(s_last_known_baud) == ESP_OK) {
+            s_detected_baudrate = s_last_known_baud;
+            LOG_INFO(TAG, "SIM7080G quick-AT OK @%lu (skip probe)",
+                     (unsigned long)s_detected_baudrate);
+            return ESP_OK;
+        }
+        // Un modem que respondio hace poco y ahora calla esta ocupado (p. ej.
+        // SMCONN/SMPUB pendiente): barrer baudios no lo acelera y genera
+        // falsos SIM_NO_AT. Se espera a que vuelva al mismo baud.
+        if (sim7080g_within_busy_grace()) {
+            s_modem_busy = true;
+            LOG_WARN(TAG, "modem ocupado: sin AT @%lu, ultima respuesta hace %lu ms; sin barrido",
+                     (unsigned long)s_last_known_baud,
+                     (unsigned long)((esp_timer_get_time() - sim7080g_hal_last_rx_us()) / 1000LL));
+            return ESP_ERR_TIMEOUT;
+        }
+        LOG_WARN(TAG, "quick-AT @%lu fallo, lanzando probe completo",
+                 (unsigned long)s_last_known_baud);
+    }
+
+    // ---- Slow path: scan completo de la lista de candidatos ----
+    uint32_t tested[sizeof(k_sim7080g_baud_candidates) / sizeof(k_sim7080g_baud_candidates[0])];
+    size_t tested_count = 0U;
+
+    for (size_t i = 0U; i < (sizeof(k_sim7080g_baud_candidates) / sizeof(k_sim7080g_baud_candidates[0])); ++i) {
+        const uint32_t baud = k_sim7080g_baud_candidates[i];
+        if (sim7080g_baud_already_tested(baud, tested_count, tested)) {
+            continue;
+        }
+        tested[tested_count++] = baud;
+
+        /* HAL init handles re-init safely: same config => flush+reuse,
+           different baud => reconfigure without UART driver teardown. */
+        const sim7080g_hal_config_t cfg = {
+            .uart_num = SIM7080G_UART_NUM,
+            .tx_pin = SIM7080G_UART_TX,
+            .rx_pin = SIM7080G_UART_RX,
+            .baudrate = baud
+        };
+
+        esp_err_t err = sim7080g_hal_init(&cfg);
+        if (err != ESP_OK) {
+            LOG_WARN(TAG, "HAL init failed @%lu", (unsigned long)baud);
+            continue;
+        }
+
+        err = sim7080g_hal_send_cmd(AT_BASIC,
+                                    NULL,
+                                    NULL,
+                                    0U,
+                                    k_probe_at_timeout_ms,
+                                    2U);
+        if (err == ESP_OK) {
+            s_detected_baudrate = baud;
+            LOG_INFO(TAG,
+                     "SIM7080G responded to AT @%lu (uart=%d tx=%d rx=%d)",
+                     (unsigned long)s_detected_baudrate,
+                     SIM7080G_UART_NUM,
+                     SIM7080G_UART_TX,
+                     SIM7080G_UART_RX);
+            // Actualiza cache RAM + NVS si cambio.
+            if (s_last_known_baud != baud) {
+                s_last_known_baud = baud;
+                sim7080g_baud_nvs_save(baud);
+                LOG_INFO(TAG, "baud cache NVS actualizado: %lu",
+                         (unsigned long)baud);
+            }
+            return ESP_OK;
+        }
+
+        LOG_WARN(TAG, "No AT response @%lu", (unsigned long)baud);
+    }
+
+    s_detected_baudrate = 0U;
+    return ESP_ERR_TIMEOUT;
+}
+
+/**
+ * @brief Inicializa modem SIM7080G y valida enlace AT base.
+ * @return ESP_OK en caso de exito.
+ */
+esp_err_t sim7080g_init(void)
+{
+    if (sim7080g_is_modem_ready()) {
+        // Health check ligero para detectar power-cycle del modem.
+        esp_err_t err = sim7080g_hal_send_cmd(AT_BASIC,
+                                              NULL,
+                                              NULL,
+                                              0U,
+                                              k_probe_at_timeout_ms,
+                                              1U);
+        s_last_at_response_ok = (err == ESP_OK);
+        if (err == ESP_OK) {
+            s_health_fail_streak = 0U;
+            s_modem_busy = false;
+            // Reaplica ATE0 por si el modem reinicio y volvio con echo activo.
+            (void)sim7080g_hal_send_cmd(AT_ECHO_OFF,
+                                        NULL,
+                                        NULL,
+                                        0U,
+                                        METER_SIM7080G_AT_TIMEOUT_MS,
+                                        1U);
+            return ESP_OK;
+        }
+
+        s_health_fail_streak++;
+        if (s_health_fail_streak < k_health_fail_force_reprobe) {
+            LOG_WARN(TAG,
+                     "modem health-check failed (%u/%u) - will retry before re-probe",
+                     (unsigned)s_health_fail_streak,
+                     (unsigned)k_health_fail_force_reprobe);
+            return err;
+        }
+
+        LOG_WARN(TAG, "modem health-check failed repeatedly, forcing re-probe");
+        /* Do NOT call sim7080g_hal_deinit() here: tearing down and
+           reinstalling the UART driver triggers an ESP-IDF spinlock
+           assert.  Instead, just reset state and let probe_modem()
+           call hal_init() which will safely flush+reuse the existing
+           driver. */
+        s_state = 0U;
+        s_health_fail_streak = 0U;
+    }
+
+    s_last_at_response_ok = false;
+    s_modem_busy = false;
+    esp_err_t err = sim7080g_probe_modem();
+    if ((err != ESP_OK) && s_modem_busy) {
+        s_state = SIM7080G_STATE_ERROR;
+        return err;
+    }
+    if (err != ESP_OK) {
+        LOG_ERROR(TAG,
+                  "SIM7080G no responde en UART%d tx=%d rx=%d. Revisar cableado, GND comun, alimentacion del modulo y baudrate.",
+                  SIM7080G_UART_NUM,
+                  SIM7080G_UART_TX,
+                  SIM7080G_UART_RX);
+        s_state = SIM7080G_STATE_ERROR;
+        return err;
+    }
+    s_last_at_response_ok = true;
+    s_health_fail_streak = 0U;
+
+    // Si el modem respondio en un baud distinto al configurado, persistirlo
+    // con AT+IPR para que el siguiente arranque lo encuentre inmediatamente.
+    if (s_detected_baudrate != (uint32_t)SIM7080G_BAUD_RATE) {
+        char ipr_cmd[32];
+        (void)snprintf(ipr_cmd, sizeof(ipr_cmd), AT_IPR_FMT, (unsigned long)SIM7080G_BAUD_RATE);
+        (void)sim7080g_hal_send_cmd(ipr_cmd, NULL, NULL, 0U, METER_SIM7080G_AT_TIMEOUT_MS, 1U);
+        // AT&W guarda la configuracion en NVRAM del SIM7080G
+        (void)sim7080g_hal_send_cmd("AT&W", NULL, NULL, 0U, METER_SIM7080G_AT_TIMEOUT_MS, 1U);
+        // Reconfigura la HAL al baud objetivo para el resto de la sesion
+        {
+            const sim7080g_hal_config_t new_cfg = {
+                .uart_num = SIM7080G_UART_NUM,
+                .tx_pin   = SIM7080G_UART_TX,
+                .rx_pin   = SIM7080G_UART_RX,
+                .baudrate = (uint32_t)SIM7080G_BAUD_RATE,
+            };
+            if (sim7080g_hal_init(&new_cfg) == ESP_OK) {
+                s_detected_baudrate = (uint32_t)SIM7080G_BAUD_RATE;
+                // Mantener cache coherente: ahora el modem vive en SIM7080G_BAUD_RATE
+                // tanto en RAM (IPR + AT&W) como en el ESP32 (HAL reconfigurada).
+                if (s_last_known_baud != (uint32_t)SIM7080G_BAUD_RATE) {
+                    s_last_known_baud = (uint32_t)SIM7080G_BAUD_RATE;
+                    sim7080g_baud_nvs_save((uint32_t)SIM7080G_BAUD_RATE);
+                }
+                LOG_INFO(TAG, "baud persistido y HAL reconfigurada a %lu", (unsigned long)SIM7080G_BAUD_RATE);
+            }
+        }
+    }
+
+    err = sim7080g_hal_send_cmd(AT_ECHO_OFF,
+                                NULL,
+                                NULL,
+                                0U,
+                                METER_SIM7080G_AT_TIMEOUT_MS,
+                                METER_SIM7080G_MAX_RETRIES);
+    if (err != ESP_OK) {
+        LOG_WARN(TAG, "ATE0 failed");
+        s_state = SIM7080G_STATE_ERROR;
+        return err;
+    }
+
+    err = sim7080g_hal_send_cmd(AT_CMEE_ON,
+                                NULL,
+                                NULL,
+                                0U,
+                                METER_SIM7080G_AT_TIMEOUT_MS,
+                                METER_SIM7080G_MAX_RETRIES);
+    if (err != ESP_OK) {
+        LOG_WARN(TAG, "CMEE enable failed (continuing)");
+    }
+
+    // Asegura modo UART sin RTS/CTS (el hardware actual usa solo TX/RX).
+    err = sim7080g_hal_send_cmd(AT_IFC_NONE,
+                                NULL,
+                                NULL,
+                                0U,
+                                METER_SIM7080G_AT_TIMEOUT_MS,
+                                1U);
+    if (err != ESP_OK) {
+        LOG_WARN(TAG, "IFC disable failed (continuing)");
+    }
+
+    err = sim7080g_wait_sim_ready(k_sim_ready_timeout_ms);
+    if (err != ESP_OK) {
+        LOG_WARN(TAG, "SIM not ready (CPIN)");
+        s_state = SIM7080G_STATE_ERROR;
+        return err;
+    }
+
+    err = sim7080g_hal_send_cmd(AT_CSQ_QUERY,
+                                NULL,
+                                NULL,
+                                0U,
+                                METER_SIM7080G_AT_TIMEOUT_MS,
+                                METER_SIM7080G_MAX_RETRIES);
+    if (err != ESP_OK) {
+        LOG_WARN(TAG, "CSQ query failed");
+        s_state = SIM7080G_STATE_ERROR;
+        return err;
+    }
+
+    // Reescribir CNMP/CMNB reconfigura la radio y provoca re-registros en la
+    // red (visibles en Kite tras cada re-probe); solo se escriben si cambian.
+    if (!sim7080g_mode_already_set(AT_CNMP_QUERY, "+CNMP:", (unsigned)METER_SIM7080G_CNMP_MODE)) {
+        char cmd[32];
+        (void)snprintf(cmd, sizeof(cmd), AT_CNMP_FMT, (unsigned)METER_SIM7080G_CNMP_MODE);
+        err = sim7080g_hal_send_cmd(cmd,
+                                    NULL,
+                                    NULL,
+                                    0U,
+                                    METER_SIM7080G_AT_TIMEOUT_MS,
+                                    METER_SIM7080G_MAX_RETRIES);
+        if (err != ESP_OK) {
+            LOG_WARN(TAG, "CNMP=%u failed (continuing)", (unsigned)METER_SIM7080G_CNMP_MODE);
+        }
+    }
+
+    if (!sim7080g_mode_already_set(AT_CMNB_QUERY, "+CMNB:", (unsigned)METER_SIM7080G_CMNB_MODE)) {
+        char cmd[32];
+        (void)snprintf(cmd, sizeof(cmd), AT_CMNB_FMT, (unsigned)METER_SIM7080G_CMNB_MODE);
+        err = sim7080g_hal_send_cmd(cmd,
+                                    NULL,
+                                    NULL,
+                                    0U,
+                                    METER_SIM7080G_AT_TIMEOUT_MS,
+                                    METER_SIM7080G_MAX_RETRIES);
+        if (err != ESP_OK) {
+            LOG_WARN(TAG, "CMNB=%u failed (continuing)", (unsigned)METER_SIM7080G_CMNB_MODE);
+        }
+    }
+
+    // Mitigacion de inestabilidad por ahorro de energia del modem.
+    err = sim7080g_hal_send_cmd(AT_CSCLK_OFF,
+                                NULL,
+                                NULL,
+                                0U,
+                                METER_SIM7080G_AT_TIMEOUT_MS,
+                                1U);
+    if (err != ESP_OK) {
+        LOG_WARN(TAG, "CSCLK disable failed (continuing)");
+    }
+    err = sim7080g_hal_send_cmd(AT_CPSMS_OFF,
+                                NULL,
+                                NULL,
+                                0U,
+                                METER_SIM7080G_AT_TIMEOUT_MS,
+                                1U);
+    if (err != ESP_OK) {
+        LOG_WARN(TAG, "CPSMS disable failed (continuing)");
+    }
+    err = sim7080g_hal_send_cmd(AT_CEDRXS_OFF,
+                                NULL,
+                                NULL,
+                                0U,
+                                METER_SIM7080G_AT_TIMEOUT_MS,
+                                1U);
+    if (err != ESP_OK) {
+        LOG_WARN(TAG, "CEDRXS disable failed (continuing)");
+    }
+
+    sim7080g_apply_operator_policy();
+
+    s_state = SIM7080G_STATE_MODEM_READY;
+    LOG_INFO(TAG,
+             "SIM7080G modem ready (baud=%lu)",
+             (unsigned long)s_detected_baudrate);
+    return ESP_OK;
+}
+
+esp_err_t sim7080g_wait_network(uint32_t timeout_ms)
+{
+    esp_err_t err = sim7080g_init();
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    const TickType_t start = xTaskGetTickCount();
+    const TickType_t timeout_ticks = pdMS_TO_TICKS(timeout_ms);
+    char response[256];
+
+    while ((xTaskGetTickCount() - start) < timeout_ticks) {
+        const char *reg_source = NULL;
+        response[0] = '\0';
+        err = sim7080g_query_network_registration(response,
+                                                  sizeof(response),
+                                                  &reg_source);
+        if (err == ESP_OK) {
+            s_state = (uint8_t)(s_state | SIM7080G_STATE_NETWORK_READY);
+            s_state = (uint8_t)(s_state & ((uint8_t)~SIM7080G_STATE_ERROR));
+            LOG_INFO(TAG,
+                     "registro celular OK via %s",
+                     (reg_source != NULL) ? reg_source : "AT");
+            sim7080g_log_radio_info();
+            return ESP_OK;
+        }
+        vTaskDelay(pdMS_TO_TICKS(2000U));
+    }
+
+    sim7080g_log_radio_info();
+    LOG_WARN(TAG, "network wait timeout. last_resp=%s", response);
+    s_state = (uint8_t)(s_state & ((uint8_t)~SIM7080G_STATE_NETWORK_READY));
+    s_state = (uint8_t)(s_state | SIM7080G_STATE_ERROR);
+    return ESP_ERR_TIMEOUT;
+}
+
+esp_err_t sim7080g_activate_pdp(void)
+{
+    esp_err_t err = sim7080g_init();
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = sim7080g_ensure_ps_attach();
+    if (err != ESP_OK) {
+        LOG_WARN(TAG, "PS attach failed before PDP activation");
+        s_state = (uint8_t)(s_state | SIM7080G_STATE_ERROR);
+        return err;
+    }
+
+    err = sim7080g_refresh_runtime_apn();
+    if (err != ESP_OK) {
+        LOG_WARN(TAG, "CGNAPN failed, usando APN configurado: %s", METER_SIM7080G_APN);
+    }
+
+    err = sim7080g_activate_pdp_cid((uint8_t)METER_SIM7080G_PDP_CID);
+    if (err != ESP_OK) {
+        sim7080g_log_ceer();
+        s_state = (uint8_t)(s_state | SIM7080G_STATE_ERROR);
+        return err;
+    }
+
+    // Lee IMEI la primera vez que se activa el PDP (s_imei vacío).
+    if (s_imei[0] == '\0') {
+        (void)sim7080g_read_imei();
+    }
+
+    s_state = (uint8_t)(s_state | SIM7080G_STATE_PDP_READY);
+    s_state = (uint8_t)(s_state & ((uint8_t)~SIM7080G_STATE_ERROR));
+    return ESP_OK;
+}
+
+esp_err_t sim7080g_cycle_pdp(void)
+{
+    char cmd[64];
+    char response[128];
+    const uint8_t cid = (uint8_t)METER_SIM7080G_PDP_CID;
+
+    // Desactiva PDP para forzar reset del stack TCP del modem.
+    // El SIM7080G puede conservar el socket TCP aunque SMSTATE indique 0.
+    // No damos por hecho que CNACT=0 tuvo efecto: verificamos el estado antes
+    // de reactivar, pues activar mientras sigue arriba no reinicia el socket.
+    (void)snprintf(cmd, sizeof(cmd), AT_CNACT_OFF_FMT, (unsigned)cid);
+    response[0] = '\0';
+    const esp_err_t deactivate_err = sim7080g_hal_send_cmd(cmd, NULL, response,
+                                                            sizeof(response), 5000U, 0U);
+    LOG_INFO(TAG, "PDP cycle deactivate cmd=%s resp=%s",
+             esp_err_to_name(deactivate_err), response);
+
+    bool deactivated = false;
+    esp_err_t query_err = ESP_OK;
+    const TickType_t start = xTaskGetTickCount();
+    const TickType_t timeout_ticks = pdMS_TO_TICKS(12000U);
+    do {
+        response[0] = '\0';
+        query_err = sim7080g_hal_send_cmd(AT_CNACT_QUERY, NULL, response,
+                                          sizeof(response), 1500U, 0U);
+        const int status = (query_err == ESP_OK)
+                               ? sim7080g_response_pdp_status_for_cid(response, cid)
+                               : -1;
+        if (status == 0) {
+            deactivated = true;
+            LOG_INFO(TAG, "PDP cycle confirmed inactive cid=%u", (unsigned)cid);
+            break;
+        }
+        if (status >= 0) {
+            LOG_INFO(TAG, "PDP cycle waiting cid=%u status=%d", (unsigned)cid, status);
+        } else {
+            LOG_WARN(TAG, "PDP cycle status unavailable err=%s resp=%s",
+                     esp_err_to_name(query_err), response);
+        }
+        vTaskDelay(pdMS_TO_TICKS(500U));
+    } while ((xTaskGetTickCount() - start) < timeout_ticks);
+
+    if (!deactivated) {
+        const esp_err_t err = (query_err != ESP_OK) ? query_err : ESP_ERR_TIMEOUT;
+        LOG_ERROR(TAG, "PDP cycle aborted: cid=%u did not confirm inactive",
+                  (unsigned)cid);
+        return err;
+    }
+
+    s_state = (uint8_t)(s_state & ((uint8_t)~SIM7080G_STATE_PDP_READY));
+    // Permite al stack IP/MQTT del modem liberar el transporte antes de
+    // abrir un contexto nuevo.
+    vTaskDelay(pdMS_TO_TICKS(2000U));
+    const esp_err_t err = sim7080g_activate_pdp_cid(cid);
+    if (err == ESP_OK) {
+        s_state = (uint8_t)(s_state | SIM7080G_STATE_PDP_READY);
+        LOG_INFO(TAG, "PDP cycle reactivate OK");
+    } else {
+        LOG_WARN(TAG, "PDP cycle reactivate failed: %s", esp_err_to_name(err));
+    }
+    return err;
+}
+
+esp_err_t sim7080g_recover_network(void)
+{
+    s_state = (uint8_t)(s_state &
+                        ((uint8_t)~(SIM7080G_STATE_NETWORK_READY | SIM7080G_STATE_PDP_READY)));
+
+    esp_err_t err = sim7080g_wait_network(METER_SIM7080G_NETWORK_TIMEOUT_MS);
+    if (err != ESP_OK) {
+        return err;
+    }
+    return sim7080g_activate_pdp();
+}
+
+esp_err_t sim7080g_refresh_runtime_state(void)
+{
+    esp_err_t err = sim7080g_init();
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    char response[256];
+    response[0] = '\0';
+    err = sim7080g_query_network_registration(response,
+                                              sizeof(response),
+                                              NULL);
+    if (err != ESP_OK) {
+        s_state = (uint8_t)(s_state & ((uint8_t)~SIM7080G_STATE_NETWORK_READY));
+        s_state = (uint8_t)(s_state & ((uint8_t)~SIM7080G_STATE_PDP_READY));
+        return err;
+    }
+
+    response[0] = '\0';
+    err = sim7080g_hal_send_cmd(AT_CGATT_QUERY,
+                                NULL,
+                                response,
+                                sizeof(response),
+                                k_runtime_query_timeout_ms,
+                                1U);
+    if ((err != ESP_OK) || !sim7080g_response_attached(response)) {
+        s_state = (uint8_t)(s_state & ((uint8_t)~SIM7080G_STATE_PDP_READY));
+        return (err == ESP_OK) ? ESP_ERR_INVALID_STATE : err;
+    }
+
+    response[0] = '\0';
+    err = sim7080g_hal_send_cmd(AT_CNACT_QUERY,
+                                NULL,
+                                response,
+                                sizeof(response),
+                                k_runtime_query_timeout_ms,
+                                1U);
+    if ((err != ESP_OK) ||
+        !sim7080g_response_pdp_ready_for_cid(response, (uint8_t)METER_SIM7080G_PDP_CID)) {
+        LOG_WARN(TAG,
+                 "runtime PDP invalid for cid=%u. resp=%s",
+                 (unsigned)METER_SIM7080G_PDP_CID,
+                 response);
+        s_state = (uint8_t)(s_state & ((uint8_t)~SIM7080G_STATE_PDP_READY));
+        return (err == ESP_OK) ? ESP_ERR_INVALID_STATE : err;
+    }
+
+    s_state = (uint8_t)(s_state | SIM7080G_STATE_NETWORK_READY | SIM7080G_STATE_PDP_READY);
+    s_state = (uint8_t)(s_state & ((uint8_t)~SIM7080G_STATE_ERROR));
+    return ESP_OK;
+}
+
+uint8_t sim7080g_get_state(void)
+{
+    return s_state;
+}
+
+bool sim7080g_is_modem_ready(void)
+{
+    return (s_state & SIM7080G_STATE_MODEM_READY) != 0U;
+}
+
+bool sim7080g_is_network_ready(void)
+{
+    return (s_state & SIM7080G_STATE_NETWORK_READY) != 0U;
+}
+
+bool sim7080g_is_pdp_ready(void)
+{
+    return (s_state & SIM7080G_STATE_PDP_READY) != 0U;
+}
+
+bool sim7080g_last_at_response_ok(void)
+{
+    return s_last_at_response_ok;
+}
+
+bool sim7080g_is_modem_busy(void)
+{
+    return s_modem_busy && !s_last_at_response_ok;
+}
+
+void sim7080g_mark_modem_unready(void)
+{
+    /* Flush UART RX buffer instead of full deinit to avoid spinlock
+       corruption on subsequent re-init. */
+    if (sim7080g_hal_is_ready()) {
+        (void)sim7080g_hal_send_cmd("AT", NULL, NULL, 0U, 200U, 1U);
+    }
+    s_state = 0U;
+    s_detected_baudrate = 0U;
+    s_health_fail_streak = 0U;
+    s_last_at_response_ok = false;
+    s_runtime_apn[0] = '\0';
+}
+
+const char *sim7080g_get_apn(void)
+{
+    return sim7080g_select_apn();
+}
+
+int sim7080g_get_reg_stat(void)
+{
+    return s_last_reg_stat;
+}
+
+/* ── rc4: acciones de la escalera de recuperacion ─────────────────────── */
+
+esp_err_t sim7080g_radio_reattach(void)
+{
+    char response[96];
+    // CFUN=4 apaga solo la radio; CFUN=0 apagaba tambien la SIM y en el banco
+    // dejo "+CME ERROR: SIM failure" al volver (banco_run02).
+    LOG_WARN(TAG, "N1: radio off/on (CFUN=4 -> CFUN=1)");
+    response[0] = '\0';
+    const esp_err_t off_err = sim7080g_hal_send_cmd("AT+CFUN=4", NULL, response,
+                                                    sizeof(response), 10000U, 1U);
+    if (off_err != ESP_OK) {
+        LOG_WARN(TAG, "CFUN=4 fallo: %s resp=%s", esp_err_to_name(off_err), response);
+    }
+    vTaskDelay(pdMS_TO_TICKS(3000U));
+    response[0] = '\0';
+    const esp_err_t on_err = sim7080g_hal_send_cmd("AT+CFUN=1", NULL, response,
+                                                   sizeof(response), 10000U, 2U);
+    s_state = (uint8_t)(s_state &
+                        ((uint8_t)~(SIM7080G_STATE_NETWORK_READY | SIM7080G_STATE_PDP_READY)));
+    s_last_reg_stat = -1;
+    if (on_err != ESP_OK) {
+        LOG_WARN(TAG, "CFUN=1 fallo: %s resp=%s", esp_err_to_name(on_err), response);
+        // El modem queda en duda: la siguiente vuelta hace la inicializacion
+        // completa (sondeo, CPIN, modos y operador).
+        sim7080g_mark_modem_unready();
+        return on_err;
+    }
+    // Confirmar CPIN READY antes de consultar registro.
+    const esp_err_t sim_err = sim7080g_wait_sim_ready(15000U);
+    if (sim_err != ESP_OK) {
+        sim7080g_mark_modem_unready();
+    }
+    return sim_err;
+}
+
+static bool sim7080g_wait_at_back(uint32_t timeout_ms)
+{
+    const TickType_t start = xTaskGetTickCount();
+    while ((xTaskGetTickCount() - start) < pdMS_TO_TICKS(timeout_ms)) {
+        if (sim7080g_hal_send_cmd(AT_BASIC, NULL, NULL, 0U, 1000U, 1U) == ESP_OK) {
+            return true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(2000U));
+    }
+    return false;
+}
+
+esp_err_t sim7080g_soft_reset(void)
+{
+    char response[96];
+    LOG_WARN(TAG, "N2: reinicio software del modem (CFUN=1,1)");
+    response[0] = '\0';
+    const esp_err_t err = sim7080g_hal_send_cmd("AT+CFUN=1,1", NULL, response,
+                                                sizeof(response), 10000U, 1U);
+    if (err != ESP_OK) {
+        // Con baud fijo el OK puede llegar despues del reinicio: no es fallo.
+        LOG_WARN(TAG, "CFUN=1,1 sin OK inmediato: %s resp=%s",
+                 esp_err_to_name(err), response);
+    }
+    vTaskDelay(pdMS_TO_TICKS(8000U));
+    const bool back = sim7080g_wait_at_back(45000U);
+    // Estado del modem desconocido tras el reinicio: inicializacion completa.
+    sim7080g_mark_modem_unready();
+    s_last_reg_stat = -1;
+    if (!back) {
+        LOG_WARN(TAG, "N2: el modem no contesto AT 53 s despues de CFUN=1,1");
+        return ESP_ERR_TIMEOUT;
+    }
+    LOG_INFO(TAG, "N2: modem contesta AT tras el reinicio");
+    return ESP_OK;
+}
+
+static bool sim7080g_ping_ok(const char *response, unsigned long *rtt_ms)
+{
+    const char *p = response;
+    while ((p != NULL) && ((p = strstr(p, "+SNPING4:")) != NULL)) {
+        p += strlen("+SNPING4:");
+        int reply_id = 0;
+        char ip[32];
+        unsigned long rtt = 0UL;
+        // Banco rc4 run03: sin respuesta el modem informa el tiempo como
+        // 60000 ms ("+SNPING4: 1,8.8.8.8,60000"); solo cuenta un eco dentro
+        // del timeout pedido (3000 ms).
+        if ((sscanf(p, " %d,%31[^,],%lu", &reply_id, ip, &rtt) == 3) && (reply_id > 0) &&
+            (rtt < 3000UL)) {
+            if (rtt_ms != NULL) {
+                *rtt_ms = rtt;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool sim7080g_dns_ok(void)
+{
+    char cmd[96];
+    char response[96];
+    char urc[160];
+    (void)snprintf(cmd, sizeof(cmd), "AT+CDNSGIP=\"%s\",1,3000",
+                   METER_CELL_RECOVERY_DNS_HOST);
+    response[0] = '\0';
+    if (sim7080g_hal_send_cmd(cmd, NULL, response, sizeof(response), 5000U, 1U) != ESP_OK) {
+        return false;
+    }
+    urc[0] = '\0';
+    if (sim7080g_hal_read_urc("+CDNSGIP:", urc, sizeof(urc), 12000U) != ESP_OK) {
+        return false;
+    }
+    const char *payload = strchr(urc, ':');
+    int result = 0;
+    return (payload != NULL) && (sscanf(payload + 1, " %d", &result) == 1) && (result == 1);
+}
+
+esp_err_t sim7080g_data_probe(char *detail, size_t detail_len)
+{
+    char cmd[96];
+    char response[256];
+    unsigned long rtt = 0UL;
+
+    (void)snprintf(cmd, sizeof(cmd), "AT+SNPDPID=%u", (unsigned)METER_SIM7080G_PDP_CID);
+    (void)sim7080g_hal_send_cmd(cmd, NULL, NULL, 0U, METER_SIM7080G_AT_TIMEOUT_MS, 1U);
+    (void)snprintf(cmd, sizeof(cmd), "AT+SNPING4=\"%s\",3,16,3000",
+                   METER_CELL_RECOVERY_PING_HOST);
+    response[0] = '\0';
+    const esp_err_t ping_err = sim7080g_hal_send_cmd(cmd, NULL, response, sizeof(response),
+                                                     14000U, 1U);
+    const bool ping = (ping_err == ESP_OK) && sim7080g_ping_ok(response, &rtt);
+    LOG_INFO(TAG, "sonda ping %s: %s resp=%s", METER_CELL_RECOVERY_PING_HOST,
+             ping ? "OK" : "sin respuesta", response);
+    if (ping) {
+        if ((detail != NULL) && (detail_len > 0U)) {
+            (void)snprintf(detail, detail_len, "ping OK %lums", rtt);
+        }
+        return ESP_OK;
+    }
+    const bool dns = sim7080g_dns_ok();
+    LOG_INFO(TAG, "sonda DNS %s: %s", METER_CELL_RECOVERY_DNS_HOST, dns ? "OK" : "fallo");
+    if ((detail != NULL) && (detail_len > 0U)) {
+        (void)snprintf(detail, detail_len, dns ? "ping no, DNS OK" : "ping y DNS fallan");
+    }
+    return dns ? ESP_OK : ESP_FAIL;
+}
+
+static char s_network_time[20];
+static time_t s_network_epoch; // 0 = aun sin sincronizar con la red
+
+esp_err_t sim7080g_read_imei(void)
+{
+    if (!sim7080g_hal_is_ready()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    char resp[64] = {0};
+    esp_err_t err = sim7080g_hal_send_cmd("AT+GSN", NULL, resp, sizeof(resp),
+                                          METER_SIM7080G_AT_TIMEOUT_MS, 1U);
+    if (err != ESP_OK) {
+        return err;
+    }
+    // Response: "\n123456789012345\r\nOK" — extract first 15-digit sequence
+    const char *p = resp;
+    while (*p && (*p < '0' || *p > '9')) { ++p; }  // skip non-digits
+    size_t i = 0U;
+    while (*p >= '0' && *p <= '9' && i < sizeof(s_imei) - 1U) {
+        s_imei[i++] = *p++;
+    }
+    s_imei[i] = '\0';
+    if (i < 14U) {
+        LOG_WARN(TAG, "IMEI parse short: '%s'", s_imei);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    LOG_INFO(TAG, "IMEI: %s", s_imei);
+    return ESP_OK;
+}
+
+const char *sim7080g_get_imei(void)
+{
+    return s_imei;
+}
+
+static bool sim_time_fields_valid(unsigned yy, unsigned month, unsigned day,
+                                  unsigned hour, unsigned minute,
+                                  unsigned second, int tz_quarters)
+{
+    static const uint8_t days_per_month[] = {
+        31U, 28U, 31U, 30U, 31U, 30U, 31U, 31U, 30U, 31U, 30U, 31U
+    };
+    if ((yy < 20U) || (yy > 99U) || (month < 1U) || (month > 12U) ||
+        (hour > 23U) || (minute > 59U) || (second > 59U) ||
+        (tz_quarters < -48) || (tz_quarters > 56)) {
+        return false;
+    }
+    unsigned max_day = days_per_month[month - 1U];
+    const unsigned year = 2000U + yy;
+    if ((month == 2U) && ((year % 4U) == 0U)) {
+        max_day = 29U;
+    }
+    return (day >= 1U) && (day <= max_day);
+}
+
+static int64_t sim_days_from_civil(int year, unsigned month, unsigned day)
+{
+    year -= (month <= 2U) ? 1 : 0;
+    const int era = (year >= 0 ? year : year - 399) / 400;
+    const unsigned yoe = (unsigned)(year - era * 400);
+    const unsigned shifted_month = (month > 2U) ? month - 3U : month + 9U;
+    const unsigned doy = (153U * shifted_month + 2U) / 5U + day - 1U;
+    const unsigned doe = yoe * 365U + yoe / 4U - yoe / 100U + doy;
+    return (int64_t)era * 146097LL + (int64_t)doe - 719468LL;
+}
+
+esp_err_t sim7080g_sync_network_time(void)
+{
+    if (!sim7080g_hal_is_ready()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    s_network_epoch = 0;
+    s_network_time[0] = '\0';
+    char resp[80] = {0};
+    esp_err_t err = sim7080g_hal_send_cmd("AT+CCLK?", "+CCLK:", resp, sizeof(resp),
+                                          METER_SIM7080G_AT_TIMEOUT_MS, 1U);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    // Response format: +CCLK: "YY/MM/DD,HH:MM:SS+ZZ"
+    // ZZ = offset de zona horaria en cuartos de hora (Colombia: -20 = UTC-5).
+    const char *q1 = strchr(resp, '"');
+    if (q1 == NULL) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    ++q1;
+    unsigned yy = 0U, mo = 0U, dd = 0U, hh = 0U, mi = 0U, ss = 0U;
+    int tz_quarters = 0;
+    const int parsed = sscanf(q1, "%u/%u/%u,%u:%u:%u%d",
+                              &yy, &mo, &dd, &hh, &mi, &ss, &tz_quarters);
+    if ((parsed != 7) ||
+        !sim_time_fields_valid(yy, mo, dd, hh, mi, ss, tz_quarters)) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    // Acotar a uint8_t para que el compilador pueda calcular el tamano
+    // maximo del snprintf (2 digitos por campo).
+    const uint8_t yy8 = (uint8_t)(yy % 100U);
+    const uint8_t mo8 = (uint8_t)(mo % 100U);
+    const uint8_t dd8 = (uint8_t)(dd % 100U);
+    const uint8_t hh8 = (uint8_t)(hh % 100U);
+    const uint8_t mi8 = (uint8_t)(mi % 100U);
+    (void)snprintf(s_network_time, sizeof(s_network_time),
+                   "20%02u-%02u-%02u %02u:%02u",
+                   (unsigned)yy8, (unsigned)mo8, (unsigned)dd8,
+                   (unsigned)hh8, (unsigned)mi8);
+
+    const int64_t local_epoch =
+        sim_days_from_civil((int)(2000U + yy), mo, dd) * 86400LL +
+        (int64_t)hh * 3600LL + (int64_t)mi * 60LL + (int64_t)ss;
+    s_network_epoch = (time_t)(local_epoch -
+        ((int64_t)tz_quarters * 15LL * 60LL));
+    return ESP_OK;
+}
+
+time_t sim7080g_get_network_epoch(void)
+{
+    return s_network_epoch;
+}
+
+const char *sim7080g_get_network_time(void)
+{
+    return s_network_time;
+}
+
+
+
+
+

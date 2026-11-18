@@ -1,0 +1,334 @@
+#include "system_event_dispatcher.h"
+
+#include <stdio.h>
+#include <string.h>
+#include <time.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+#include "freertos/task.h"
+#include "data_serializer.h"
+#include "logger.h"
+#include "meter_config.h"
+#include "mqtt_topics.h"
+#include "rtos_app_config.h"
+#include "storage_service.h"
+#include "system_health.h"
+
+#define SYSTEM_ALERT_QUEUE_LEN      32U
+
+static const char *TAG = "event_dispatch";
+static TaskHandle_t s_task_handle;
+static StaticQueue_t s_alert_queue_buffer;
+static uint8_t s_alert_queue_storage[SYSTEM_ALERT_QUEUE_LEN * sizeof(system_event_t)];
+static QueueHandle_t s_alert_queue;
+
+#if METER_STORAGE_ENABLE
+static void sanitize_detail(const char *src, char *dst, size_t dst_len)
+{
+    if ((dst == NULL) || (dst_len == 0U)) {
+        return;
+    }
+    size_t out = 0U;
+    if (src != NULL) {
+        for (size_t i = 0U; (src[i] != '\0') && (out + 1U < dst_len); ++i) {
+            const char c = src[i];
+            if ((c == '"') || (c == '\\') || (c == '\n') || (c == '\r')) {
+                dst[out++] = ' ';
+            } else {
+                dst[out++] = c;
+            }
+        }
+    }
+    dst[out] = '\0';
+}
+
+static void format_timestamp(int64_t epoch_utc_s,
+                             bool valid,
+                             char *utc,
+                             size_t utc_len,
+                             char *local,
+                             size_t local_len)
+{
+    if (!valid || !system_time_epoch_is_valid(epoch_utc_s)) {
+        if (utc_len > 0U) {
+            utc[0] = '\0';
+        }
+        if (local_len > 0U) {
+            local[0] = '\0';
+        }
+        return;
+    }
+
+    const time_t utc_epoch = (time_t)epoch_utc_s;
+    const time_t local_epoch = utc_epoch +
+        ((time_t)SYSTEM_TIMEZONE_OFFSET_MIN * (time_t)60);
+    struct tm utc_tm = {0};
+    struct tm local_tm = {0};
+    (void)gmtime_r(&utc_epoch, &utc_tm);
+    (void)gmtime_r(&local_epoch, &local_tm);
+    (void)strftime(utc, utc_len, "%Y-%m-%dT%H:%M:%SZ", &utc_tm);
+    (void)strftime(local, local_len, "%Y-%m-%dT%H:%M:%S-05:00", &local_tm);
+}
+#endif
+
+static void persist_event(const system_event_t *event)
+{
+#if !METER_STORAGE_ENABLE
+    (void)event;
+    return;
+#else
+    if (event == NULL) {
+        return;
+    }
+
+    char utc[32];
+    char local[40];
+    char detail[SYSTEM_EVENT_DETAIL_LEN];
+    char line[512];
+    format_timestamp(event->timestamp_utc_s, event->time_valid,
+                     utc, sizeof(utc), local, sizeof(local));
+    sanitize_detail(event->detail, detail, sizeof(detail));
+
+    const int len = snprintf(
+        line, sizeof(line),
+        "{\"v\":%u,\"device\":\"%s\",\"boot\":%lu,\"seq\":%lu,"
+        "\"ts_utc\":%lld,\"utc\":\"%s\",\"local\":\"%s\","
+        "\"time_valid\":%s,\"uptime_ms\":%lld,\"type\":\"event\","
+        "\"severity\":\"%s\",\"module\":\"%s\",\"code\":\"%s\","
+        "\"transition\":\"%s\",\"state\":\"%s\",\"error\":%ld,"
+        "\"count\":%lu,\"detail\":\"%s\"}",
+        (unsigned)event->version,
+        mqtt_topics_device_id(),
+        (unsigned long)event->boot_id,
+        (unsigned long)event->sequence,
+        (long long)event->timestamp_utc_s,
+        utc,
+        local,
+        event->time_valid ? "true" : "false",
+        (long long)(event->uptime_us / 1000LL),
+        system_severity_name(event->severity),
+        system_module_name(event->module),
+        system_event_code_name(event->code),
+        system_event_transition_name(event->transition),
+        system_state_name(event->resulting_state),
+        (long)event->error,
+        (unsigned long)event->occurrence_count,
+        detail);
+    if ((len > 0) && ((size_t)len < sizeof(line))) {
+        if (storage_service_submit_event(line) != ESP_OK) {
+            LOG_WARN(TAG, "no se pudo persistir evento seq=%lu",
+                     (unsigned long)event->sequence);
+        }
+    }
+#endif
+}
+
+static bool persist_alert(const system_event_t *event)
+{
+#if !METER_STORAGE_ENABLE
+    (void)event;
+    return false;
+#else
+    if (event == NULL) {
+        return false;
+    }
+    if (!METER_COMM_ENABLE) {
+        /* rc3: sin comunicaciones (perfil de metrologia) nada publicara la
+         * alerta, y encolarla en la SD solo deja un atraso que el firmware
+         * siguiente envia antes que sus propias alertas (19 AC_LOST/RESTORED
+         * de la corrida nocturna con metro-r1). El evento ya quedo en
+         * events_v1.jsonl; se da por atendida sin usar la cola RAM. */
+        return true;
+    }
+    char payload[768];
+    if (data_serializer_build_senml_system_event(event, payload,
+                                                 sizeof(payload)) != ESP_OK) {
+        return false;
+    }
+    return storage_service_submit_alert(payload) == ESP_OK;
+#endif
+}
+
+/*
+ * rc6.3 (2026-11-10): orden de RAISED/CLEARED. En E4-03 el RAISED de una falla
+ * de SD iba a la cola RAM (la SD no estaba) y el CLEARED, ya remontada, a la
+ * cola SD, que se vacia cada 1 s; la RAM salia cada ~15 s. El backend recibia
+ * CLEARED antes que RAISED y la alarma quedaba abierta.
+ *  - Las alertas del modulo SD no se guardan en la SD: van siempre por RAM
+ *    (ademas cortan la realimentacion "falla SD -> alerta -> escribir SD").
+ *  - Mientras la RAM tenga alertas de otros modulos, las nuevas la siguen
+ *    (FIFO), salvo que este casi llena: ahi se prefiere guardarlas en la SD.
+ *  - task_communication publica la RAM cada 1 s, despues de la cola SD.
+ */
+#define SYSTEM_ALERT_FIFO_LIMIT     24U
+static portMUX_TYPE s_ram_mux = portMUX_INITIALIZER_UNLOCKED;
+static uint32_t s_ram_non_sd;
+
+static void ram_count_add(const system_event_t *event, int delta)
+{
+    if ((event == NULL) || (event->module == SYSTEM_MODULE_SD)) {
+        return;
+    }
+    taskENTER_CRITICAL(&s_ram_mux);
+    if (delta > 0) {
+        ++s_ram_non_sd;
+    } else if (s_ram_non_sd > 0U) {
+        --s_ram_non_sd;
+    }
+    taskEXIT_CRITICAL(&s_ram_mux);
+}
+
+static bool alert_stays_in_ram(const system_event_t *event)
+{
+    if (event->module == SYSTEM_MODULE_SD) {
+        return true;
+    }
+    taskENTER_CRITICAL(&s_ram_mux);
+    const uint32_t non_sd = s_ram_non_sd;
+    taskEXIT_CRITICAL(&s_ram_mux);
+    return (non_sd > 0U) && (system_alert_pending_count() < SYSTEM_ALERT_FIFO_LIMIT);
+}
+
+static void enqueue_alert(const system_event_t *event)
+{
+    if (event == NULL) {
+        return;
+    }
+    // Las recuperaciones informativas deben llegar al backend: alli cierran
+    // incidentes SIM_OFF/AC_LOST y conservan su fecha de finalizacion.
+    const bool resolves_fault = (event->transition == SYSTEM_EVENT_CLEARED) ||
+        (event->code == SYSTEM_EVENT_MODULE_READY) ||
+        (event->code == SYSTEM_EVENT_AC_RESTORED) ||
+        (event->code == SYSTEM_EVENT_TIME_SYNCED);
+    if ((event->severity < SYSTEM_SEVERITY_WARNING) && !resolves_fault) {
+        return;
+    }
+    if (!alert_stays_in_ram(event)) {
+        if (persist_alert(event)) {
+            return;
+        }
+    } else if (!METER_COMM_ENABLE) {
+        return;  /* sin comunicaciones nadie vacia la cola RAM (ver persist_alert) */
+    }
+    if (xQueueSend(s_alert_queue, event, 0) != pdTRUE) {
+        system_event_t oldest;
+        if (xQueueReceive(s_alert_queue, &oldest, 0) == pdTRUE) {
+            ram_count_add(&oldest, -1);
+            if (xQueueSend(s_alert_queue, event, 0) == pdTRUE) {
+                ram_count_add(event, +1);
+            }
+        }
+        LOG_WARN(TAG, "cola MQTT de alertas llena; se reemplazo la mas antigua");
+    } else {
+        ram_count_add(event, +1);
+    }
+}
+
+static void dispatch_event(const system_event_t *event)
+{
+    if (event->severity == SYSTEM_SEVERITY_CRITICAL) {
+        LOG_ERROR(TAG, "%s/%s %s state=%s err=%s count=%lu detail=%s",
+                  system_module_name(event->module),
+                  system_event_code_name(event->code),
+                  system_event_transition_name(event->transition),
+                  system_state_name(event->resulting_state),
+                  esp_err_to_name(event->error),
+                  (unsigned long)event->occurrence_count,
+                  event->detail);
+    } else if (event->severity == SYSTEM_SEVERITY_WARNING) {
+        LOG_WARN(TAG, "%s/%s %s state=%s err=%s count=%lu detail=%s",
+                 system_module_name(event->module),
+                 system_event_code_name(event->code),
+                 system_event_transition_name(event->transition),
+                 system_state_name(event->resulting_state),
+                 esp_err_to_name(event->error),
+                 (unsigned long)event->occurrence_count,
+                 event->detail);
+    } else {
+        LOG_INFO(TAG, "%s/%s %s state=%s detail=%s",
+                 system_module_name(event->module),
+                 system_event_code_name(event->code),
+                 system_event_transition_name(event->transition),
+                 system_state_name(event->resulting_state),
+                 event->detail);
+    }
+
+    persist_event(event);
+    enqueue_alert(event);
+}
+
+static void task_system_events(void *arg)
+{
+    (void)arg;
+    system_event_t event;
+    for (;;) {
+        if (system_event_receive(&event, portMAX_DELAY) == ESP_OK) {
+            dispatch_event(&event);
+        }
+    }
+}
+
+esp_err_t system_event_dispatcher_start(void)
+{
+    if (s_task_handle != NULL) {
+        return ESP_OK;
+    }
+    if (!system_health_is_initialized()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (s_alert_queue == NULL) {
+        s_alert_queue = xQueueCreateStatic(SYSTEM_ALERT_QUEUE_LEN,
+                                           sizeof(system_event_t),
+                                           s_alert_queue_storage,
+                                           &s_alert_queue_buffer);
+    }
+    if (s_alert_queue == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    (void)data_serializer_init();
+
+    const BaseType_t rc = xTaskCreatePinnedToCore(
+        task_system_events,
+        "task_events",
+        TASK_STACK_SYSTEM_EVENTS,
+        NULL,
+        TASK_PRIO_SYSTEM_EVENTS,
+        &s_task_handle,
+        tskNO_AFFINITY);
+    if (rc != pdPASS) {
+        s_task_handle = NULL;
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
+esp_err_t system_alert_peek(system_event_t *out)
+{
+    if (out == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (s_alert_queue == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    return (xQueuePeek(s_alert_queue, out, 0) == pdTRUE)
+               ? ESP_OK : ESP_ERR_NOT_FOUND;
+}
+
+esp_err_t system_alert_discard(void)
+{
+    if (s_alert_queue == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    system_event_t discarded;
+    if (xQueueReceive(s_alert_queue, &discarded, 0) != pdTRUE) {
+        return ESP_ERR_NOT_FOUND;
+    }
+    ram_count_add(&discarded, -1);
+    return ESP_OK;
+}
+
+uint32_t system_alert_pending_count(void)
+{
+    return (s_alert_queue != NULL) ? (uint32_t)uxQueueMessagesWaiting(s_alert_queue) : 0U;
+}
